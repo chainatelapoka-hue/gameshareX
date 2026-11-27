@@ -2,7 +2,6 @@ package com.gameshare.x
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -11,12 +10,12 @@ import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import androidx.annotation.RequiresApi
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.delay
 
 /**
- * Joins the host's Wi-Fi Direct group and returns the [Network] that holds the group's 192.168.49.x
- * address. Android 10+ uses WifiNetworkSpecifier; Android 7-9 use the older addNetwork API.
+ * Joins the host's Wi-Fi Direct network and returns the [Network] that holds the host's
+ * 192.168.49.x address. Android 10+ uses WifiNetworkSpecifier; Android 7-9 use addNetwork.
+ * Polls every second and reports the Wi-Fi state if it never gets an address.
  */
 class WifiJoiner(context: Context) {
     private val appContext = context.applicationContext
@@ -24,42 +23,52 @@ class WifiJoiner(context: Context) {
     private val wifi = appContext.getSystemService(WifiManager::class.java)
     private var callback: ConnectivityManager.NetworkCallback? = null
 
-    suspend fun join(info: JoinInfo, timeoutMs: Long = 30_000L): Network {
+    suspend fun join(info: JoinInfo, timeoutMs: Long = 40_000L): Network {
         release()
-        val found = CompletableDeferred<Network>()
-        val callbackForNetwork = object : ConnectivityManager.NetworkCallback() {
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                if (linkProperties.hasHostGroupAddress()) found.complete(network)
-            }
-        }
-        callback = callbackForNetwork
-
-        val builder = NetworkRequest.Builder()
+        // Keeps Android bringing the Wi-Fi network up. Required on Android 10+.
+        val keepAlive = object : ConnectivityManager.NetworkCallback() {}
+        callback = keepAlive
+        val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setNetworkSpecifier(specifierFor(info))
-            connectivity.requestNetwork(builder.build(), callbackForNetwork)
-        } else {
-            connectLegacy(info)
-            connectivity.requestNetwork(builder.build(), callbackForNetwork)
-        }
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setNetworkSpecifier(specifierFor(info))
+            }
+            .build()
 
-        return try {
-            withTimeout(timeoutMs) { found.await() }
-        } catch (e: Exception) {
-            release()
-            throw IllegalStateException(
-                "Host-এর Wi-Fi-তে যুক্ত হওয়া যায়নি। নাম ও passphrase ঠিক আছে কিনা দেখুন।",
-                e,
-            )
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) connectLegacy(info)
+        connectivity.requestNetwork(request, keepAlive)
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var lastState = "শুরু হয়নি"
+        while (System.currentTimeMillis() < deadline) {
+            findHostNetwork()?.let { return it }
+            lastState = describeWifi()
+            delay(1000L)
         }
+        release()
+        throw IllegalStateException("Host-এর network-এর IP পাওয়া যায়নি। অবস্থা: $lastState")
     }
 
-    /** Stops listening for the host network. The caller should also unbind the process. */
+    /** Stops keeping the host network alive. The caller should also unbind the process. */
     fun release() {
         callback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
         callback = null
+    }
+
+    private fun findHostNetwork(): Network? =
+        connectivity.allNetworks.firstOrNull { network ->
+            val caps = connectivity.getNetworkCapabilities(network)
+            val link = connectivity.getLinkProperties(network)
+            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                link?.linkAddresses?.any { it.address.hostAddress?.startsWith("192.168.49.") == true } == true
+        }
+
+    private fun describeWifi(): String {
+        val conn = wifi.connectionInfo
+        val gateway = wifi.dhcpInfo?.gateway ?: 0
+        val gw = "${gateway and 0xff}.${(gateway shr 8) and 0xff}.${(gateway shr 16) and 0xff}.${(gateway shr 24) and 0xff}"
+        return "Wi-Fi ${conn?.supplicantState ?: "?"}, SSID ${conn?.ssid ?: "?"}, gateway $gw"
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
@@ -72,8 +81,13 @@ class WifiJoiner(context: Context) {
     @Suppress("DEPRECATION")
     private fun connectLegacy(info: JoinInfo) {
         if (!wifi.isWifiEnabled) wifi.isWifiEnabled = true
+        // Remove older saved entries for this name so a stale password can't block the join.
+        val quoted = "\"${info.ssid}\""
+        runCatching {
+            wifi.configuredNetworks?.filter { it.SSID == quoted }?.forEach { wifi.removeNetwork(it.networkId) }
+        }
         val config = WifiConfiguration().apply {
-            SSID = "\"${info.ssid}\""
+            SSID = quoted
             preSharedKey = "\"${info.passphrase}\""
             allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK)
         }
@@ -83,7 +97,4 @@ class WifiJoiner(context: Context) {
         wifi.enableNetwork(netId, true)
         wifi.reconnect()
     }
-
-    private fun LinkProperties.hasHostGroupAddress(): Boolean =
-        linkAddresses.any { it.address.hostAddress?.startsWith("192.168.49.") == true }
 }
